@@ -28,16 +28,26 @@ Today the only way to run such a job is to loop over `POST /v1/chat/completions`
 
 ### Measured impact (synthetic benchmark)
 
-The proof of concept ships a benchmark ([`scripts/2026-11-11-batch-mode-benchmark.py`](scripts/2026-11-11-batch-mode-benchmark.py)). A mock provider stands for a GPU server: it computes 8 requests at a time, 0.5 s each (16 requests/s at most), and OpenGateLLM fronts it with `qos_limit: 8`. Interactive traffic arrives at 4 requests/s (Poisson, about 25 % of the capacity) for 30 s while a 300-request job runs:
+The proof of concept ships a benchmark ([`scripts/2026-11-11-batch-mode-benchmark.py`](scripts/2026-11-11-batch-mode-benchmark.py)). A mock provider stands for a GPU server: it computes 8 requests at a time, 0.5 s each (16 requests/s at most), and OpenGateLLM fronts it with `qos_limit: 8` and `qos_retries_before_reject: 20`. Interactive traffic arrives at random (Poisson) for 30 s while a 300-request job runs. The job is sent either as users send it today, looping over `/v1/chat/completions` with 32 concurrent requests and a retry on 503, or as a batch.
+
+**Interactive traffic at 4 requests/s (about 25 % of the capacity)**
 
 | Scenario | Interactive p50 | p95 | p99 | max | Interactive failed | Job duration |
 |---|---|---|---|---|---|---|
-| Interactive traffic alone | 0.54 s | 0.56 s | 0.58 s | 0.58 s | 0 / 122 | — |
-| + job looping over `/v1/chat/completions` (32 concurrent, retry on 503) | 1.27 s | **6.02 s** | **8.67 s** | 10.63 s | 1 / 104 | 28 s |
-| + same job submitted as a batch | 0.54 s | **0.55 s** | **0.57 s** | 0.58 s | 0 / 100 | 58 s |
+| Interactive traffic alone | 0.54 s | 0.57 s | 0.59 s | 0.61 s | 0 / 122 | — |
+| + job looping over `/v1/chat/completions` | 1.21 s | **6.64 s** | **9.84 s** | 10.28 s | **3 / 104** | 27 s |
+| + same job submitted as a batch | 0.54 s | **0.56 s** | **0.57 s** | 0.57 s | **0 / 100** | 58 s |
 | Batch alone (no interactive traffic) | — | — | — | — | — | 43 s |
 
-All 300 batch requests succeeded. A bulk job sent the way users send it today makes the interactive p95 latency 10 times worse. The same job sent as a batch leaves interactive latency unchanged, and takes longer because it only uses the capacity left over.
+**Interactive traffic at 8 requests/s (about 50 % of the capacity)**
+
+| Scenario | Interactive p50 | p95 | p99 | max | Interactive failed | Job duration |
+|---|---|---|---|---|---|---|
+| Interactive traffic alone | 0.54 s | 1.06 s | 1.22 s | 1.72 s | 0 / 245 | — |
+| + job looping over `/v1/chat/completions` | 2.16 s | **8.72 s** | **9.77 s** | 10.68 s | **29 / 239** | 39 s |
+| + same job submitted as a batch | 0.54 s | **0.60 s** | **1.06 s** | 1.10 s | **0 / 225** | 68 s |
+
+Every batch request succeeded. A bulk job sent the way users send it today makes the interactive p95 latency about 10 times worse, and at 50 % load 12 % of the interactive requests fail. The same job sent as a batch leaves interactive latency at the level of interactive traffic alone (the differences between these two rows are within the run-to-run variance of random arrivals). It takes longer because it only uses the capacity left over, and it slows down as interactive load grows.
 
 These numbers come from a mock provider on a single machine. They show the mechanism, not production capacity. Real figures need a run against a staging vLLM.
 
@@ -78,20 +88,21 @@ Two tables: `batch` (owner, key, status, timestamps) and `batch_request` (one ro
 
 Postgres is the queue. Redis cannot be: gunicorn flushes it at every API start (`scripts/gunicorn.conf.py`), and it is not configured for durability.
 
-* **Claim**: one `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING …` statement marks requests `processing` with a lease (`locked_until`). Several workers never claim the same request.
-* **Fairness**: requests are claimed lowest `position` first (rank of the request in its batch), so a small batch submitted after a large one is not stuck behind it.
-* **Crash safety**: a request whose lease expires goes back to the queue (at-least-once processing).
+* **Claim**: one `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING …` statement marks requests `processing`, gives each a `claim_id` and a lease (`locked_until`). Several workers never claim the same request. Only requests of batches `in_progress` are claimed.
+* **Lease**: the worker extends the leases of the requests it is processing every 20 s (lease: 60 s), so a claim stays valid however long the provider takes, and expires about a minute after its worker dies.
+* **Crash safety**: a request whose lease expires goes back to the queue and counts an attempt, so a request that kills its worker is not retried forever. The outcome is written only by the holder of the current `claim_id`: a worker whose claim expired cannot overwrite the result of the worker that claimed the request again.
+* **Fairness**: requests are claimed lowest `position` first (rank of the request in its batch), so a small batch submitted after a large one is not stuck behind it. The flip side: under a steady inflow of new batches, the tail of a large batch waits, and may expire.
 * Every worker-side statement is a single statement on an `AutocommitSession`: the worker never holds a transaction, nor a pooled connection, during a provider call.
 
 ### 3. Worker
 
-`api/worker.py` is a new composition root, like `lifespan.py`. `BatchWorker` (`api/infrastructure/worker/`) claims up to `batch_worker_concurrency` requests, processes them concurrently, and runs a periodic reconciliation step: release expired leases, expire the pending requests of overdue batches, end finished batches. On SIGTERM it stops claiming and waits for the requests in progress.
+`api/worker.py` is a new composition root, like `lifespan.py`. `BatchWorker` (`api/infrastructure/worker/`) claims up to `batch_worker_concurrency` requests, processes them concurrently, extends their leases, and runs a periodic reconciliation step: release expired claims, cancel the requests that went back to the queue after their batch was canceled, expire the pending requests of overdue batches, end finished batches. On SIGTERM it stops claiming and waits up to 30 s for the requests in progress; the ones it interrupts go back to the queue when their claim expires.
 
-The worker is optional: without it, batches are accepted and stay `in_progress` until they expire.
+The worker is optional, and the reconciliation runs inside it: without a worker, batches are accepted and stay `in_progress` indefinitely.
 
 ### 4. Spare capacity only
 
-The provider concurrency limiter counts every request a provider holds, interactive or batch, in one Redis sorted set. Interactive requests reserve a place while the load is below `qos_limit`. Batch requests reserve one only while the load is below `batch_provider_capacity_share × qos_limit` (0.5 by default), or below `batch_provider_default_concurrency` for providers without `qos_limit`.
+The provider concurrency limiter counts every request a provider holds, interactive or batch, in one Redis sorted set. Interactive requests reserve a place while the load is below `qos_limit`. Batch requests reserve one only while the load is below `batch_provider_capacity_share × qos_limit` rounded down (0.5 by default: 4 places out of 8, none out of 1), or below `batch_provider_default_concurrency` for providers without `qos_limit`.
 
 * Interactive traffic always keeps at least the rest of the capacity, and takes all of it when batch requests are not running.
 * A batch request never waits for a provider and never gets a 429: without spare capacity it goes back to the queue and the worker pauses its claims briefly.
@@ -132,29 +143,31 @@ Each succeeded request writes a regular `usage` row with `endpoint = /v1/chat/co
 
 * One more process to deploy and monitor (the worker), with its own Helm/compose service.
 * Two more tables, whose size grows with the results kept: a retention period and a purge job are needed.
-* At-least-once processing: if a worker dies after the provider answered but before the result is stored, the request is processed, and billed, twice.
-* Maintenance surface: the POC adds about 1,750 lines of production code and 1,200 lines of tests.
+* At-least-once processing: if a worker dies after the provider answered but before the result is stored, the request is processed, and billed, twice. Only one result is stored.
+* Maintenance surface: the POC adds about 1,900 lines of production code and 1,450 lines of tests.
 
 ---
 
 ## Proof of concept
 
-The POC on branch `feat/batch-mode` implements decisions 1–5 for chat completions, with unit tests for every use case branch, integration tests for the repository, the endpoints and the migration, and the benchmark above. The existing test suite passes unchanged.
+The POC on branch `feat/batch-mode` implements decisions 1–5 for chat completions, with unit tests for every use case branch and for the worker loop, integration tests for the repository, the endpoints and the migration, and the benchmark above. The existing test suite passes unchanged. An independent code review found two state-transition bugs (a stale outcome overwriting a newer one after a lease expiry, canceled batches still processing their requeued requests), fixed in the POC.
 
 Not in the POC (needed before production):
 
-* rate limits / quotas for batches and a batch price (see open questions);
+* **quotas for batches (blocking)**: the POC neither checks nor charges any rate limit for batch requests, so a user with an RPD limit could bypass it through a batch. The router must ship disabled until open question 1 is settled;
+* a batch price (open question 2);
 * retention and purge of results, `DELETE`;
 * Prometheus metrics (queue depth, batch throughput), Langfuse traces for batch requests (the worker uses a no-op tracer);
-* a lease heartbeat for provider calls longer than the lease (15 min), and the `test_autocommitsession.py`-style probe for the worker;
+* the `test_autocommitsession.py`-style probe for the worker;
 * claiming per router: a worker currently claims before knowing whether the router has spare capacity, and pauses all claims when one router is full;
+* refactoring rather than copying: `ProcessBatchRequestUseCase` copies the provider reservation loop of the forwarding template with another limit, and carries a rate limiter it never calls. Passing the limit to the template, and moving `UsageRecorder` out of `infrastructure/fastapi/`, would remove both;
 * Helm/compose service, documentation, playground page, `AGENTS.md` section on the worker.
 
 ---
 
 ## Open questions for the maintainers
 
-1. **Rate limits.** The POC neither checks nor charges RPM/TPM/RPD/TPD for batch requests, as Anthropic keeps separate batch limits. Should batches count toward the daily limits (TPD/RPD)? Should a new limit type cap the number of pending batch requests per user or role?
+1. **Rate limits (blocking).** The POC neither checks nor charges RPM/TPM/RPD/TPD for batch requests; Anthropic keeps separate batch limits. Should batches count toward the daily limits (TPD/RPD)? Should a new limit type cap the number of pending batch requests per user or role?
 2. **Price.** A batch discount (a multiplier on the router cost, global or per router)?
 3. **Capacity share.** Is 50 % of `qos_limit` the right default? Should it be configurable per router? What should the default be for providers without `qos_limit`?
 4. **Fairness unit.** Batches are interleaved by progress. Should fairness be per user or per organization instead, and should it use `user.priority`?
