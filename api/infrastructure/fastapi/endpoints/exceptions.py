@@ -54,6 +54,14 @@ class KeyExpirationInvalidHTTPException(HTTPException):
         )
 
 
+class BatchCustomIdNotUniqueHTTPException(HTTPException):
+    status_code = 400
+    detail = "custom_id must be unique within a batch. Duplicated: {custom_ids}."
+
+    def __init__(self, custom_ids: list[str]) -> None:
+        super().__init__(status_code=self.status_code, detail=f"custom_id must be unique within a batch. Duplicated: {', '.join(custom_ids)}.")
+
+
 # 401
 class InvalidAPIKeyHTTPException(HTTPException):
     status_code = 401
@@ -199,7 +207,34 @@ class KeyNotFoundHTTPException(HTTPException):
         super().__init__(status_code=self.status_code, detail=f"Key {key_id} not found.")
 
 
+class BatchNotFoundHTTPException(HTTPException):
+    status_code = 404
+    detail = "Batch {batch_id} not found."
+
+    def __init__(self, batch_id: int) -> None:
+        super().__init__(status_code=self.status_code, detail=f"Batch {batch_id} not found.")
+
+
 # 409
+class BatchAlreadyEndedHTTPException(HTTPException):
+    status_code = 409
+    detail = "Batch {batch_id} has already ended."
+
+    def __init__(self, batch_id: int) -> None:
+        super().__init__(status_code=self.status_code, detail=f"Batch {batch_id} has already ended.")
+
+
+class BatchNotEndedHTTPException(HTTPException):
+    status_code = 409
+    detail = "Batch {batch_id} has not ended yet: its results are available once its processing_status is ended."
+
+    def __init__(self, batch_id: int) -> None:
+        super().__init__(
+            status_code=self.status_code,
+            detail=f"Batch {batch_id} has not ended yet: its results are available once its processing_status is ended.",
+        )
+
+
 class UserAlreadyExistsHTTPException(HTTPException):
     status_code = 409
     detail = "User {email} already exists."

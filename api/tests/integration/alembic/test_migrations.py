@@ -13,6 +13,7 @@ from sqlalchemy.pool import NullPool
 from api.domain.role.entities import PermissionType
 from api.infrastructure.postgres.models import Base
 from api.tests.integration.factories.sql import (
+    BatchRequestSQLFactory,
     KeySQLFactory,
     LimitSQLFactory,
     PermissionSQLFactory,
@@ -86,6 +87,7 @@ def _insert_a_row_in_every_table(engine: Engine) -> None:
             PermissionSQLFactory(role=user.role, permission=permission)
         LimitSQLFactory(role=user.role, router=router)
         UsageSQLFactory(user=user, token_id=key.id, router_id=router.id, provider_id=provider.id)
+        BatchRequestSQLFactory(batch__key=key)
         session.commit()
 
         empty_tables = [table.name for table in Base.metadata.sorted_tables if session.scalar(select(func.count()).select_from(table)) == 0]

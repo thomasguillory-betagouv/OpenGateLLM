@@ -6,10 +6,24 @@ from factory import fuzzy
 from factory.alchemy import SQLAlchemyModelFactory
 from faker import Faker
 
+from api.domain.batch.entities import BatchProcessingStatus, BatchRequestStatus
 from api.domain.provider.entities import HostingZone, ProviderType
 from api.domain.role.entities import LimitType, PermissionType
 from api.domain.router.entities import RouterLoadBalancingStrategy, RouterType
-from api.infrastructure.postgres.models import Limit, Organization, Permission, Provider, Role, Router, RouterAlias, Token, Usage, User
+from api.infrastructure.postgres.models import (
+    Batch,
+    BatchRequest,
+    Limit,
+    Organization,
+    Permission,
+    Provider,
+    Role,
+    Router,
+    RouterAlias,
+    Token,
+    Usage,
+    User,
+)
 
 fake = Faker("fr_FR")
 
@@ -252,3 +266,37 @@ class UsageSQLFactory(BaseSQLFactory):
     class Params:
         failed = factory.Trait(status=500)
         embeddings = factory.Trait(endpoint="/v1/embeddings")
+
+
+class BatchSQLFactory(BaseSQLFactory):
+    class Meta:
+        model = Batch
+
+    key_id = None
+    key = factory.SubFactory(KeySQLFactory)
+    user_id = None
+    user = factory.LazyAttribute(lambda o: o.key.user)
+    processing_status = BatchProcessingStatus.IN_PROGRESS
+    created = factory.LazyFunction(lambda: datetime.now(tz=UTC))
+    expires = factory.LazyFunction(lambda: datetime.now(tz=UTC) + timedelta(hours=24))
+    ended = None
+    cancel_initiated = None
+
+
+class BatchRequestSQLFactory(BaseSQLFactory):
+    class Meta:
+        model = BatchRequest
+
+    batch_id = None
+    batch = factory.SubFactory(BatchSQLFactory)
+    custom_id = factory.Sequence(lambda n: f"request-{n}")
+    position = factory.Sequence(lambda n: n)
+    params = factory.LazyFunction(lambda: {"model": "my-model", "messages": [{"role": "user", "content": "Hello"}]})
+    status = BatchRequestStatus.PENDING
+    attempts = 0
+    # Postgres now() is the start of the test transaction, which the factory runs after
+    available_at = factory.LazyFunction(lambda: datetime.now(tz=UTC) - timedelta(hours=1))
+    locked_until = None
+    response = None
+    error = None
+    completed = None

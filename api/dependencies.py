@@ -8,6 +8,7 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.domain.auth import AuthSsoSessionValidator
+from api.domain.batch import BatchRepository
 from api.domain.key import KeyEncoder, KeyRepository
 from api.domain.model import ModelEnvironmentalImpactsComputer, ModelQuery, ModelTokenizer
 from api.domain.organization import OrganizationRepository
@@ -32,6 +33,7 @@ from api.infrastructure.langfuse import LangfuseRequestTracer
 from api.infrastructure.postgres import (
     AutocommitSession,
     PostgresAuthenticatedUserQuery,
+    PostgresBatchRepository,
     PostgresKeyRepository,
     PostgresLimitRepository,
     PostgresModelQuery,
@@ -65,6 +67,7 @@ from api.use_cases.admin.routers import CreateRouterUseCase, DeleteRouterUseCase
 from api.use_cases.admin.users import CreateUserUseCase, DeleteUserUseCase, GetOneUserUseCase, GetUsersUseCase, UpdateUserUseCase
 from api.use_cases.audio import CreateAudioTranscriptionsUseCase
 from api.use_cases.auth import AuthLoginUseCase, AuthSsoLoginUseCase
+from api.use_cases.batches import CancelBatchUseCase, CreateBatchUseCase, GetBatchesUseCase, GetBatchResultsUseCase, GetOneBatchUseCase
 from api.use_cases.chat import CreateChatCompletionsUseCase
 from api.use_cases.embeddings import CreateEmbeddingsUseCase
 from api.use_cases.health import GetHealthModelsUseCase
@@ -201,6 +204,10 @@ def _provider_repository(session: AsyncSession) -> ProviderRepository:
     return PostgresProviderRepository(postgres_session=session)
 
 
+def _batch_repository(session: AsyncSession) -> BatchRepository:
+    return PostgresBatchRepository(postgres_session=session)
+
+
 def _usage_repository(postgres_session: AutocommitSession = Depends(get_autocommit_postgres_session)) -> UsageRepository:
     return PostgresUsageRepository(postgres_session=postgres_session, session_factory=global_context.autocommit_postgres_session_factory)
 
@@ -245,6 +252,30 @@ def create_audio_transcriptions_use_case_factory(
         random_generator=random.Random(),
         audio_file_size_limit=configuration.settings.audio_file_size_limit,
     )
+
+
+# batch use cases
+def create_batch_use_case_factory(postgres_session: AsyncSession = Depends(get_postgres_session)) -> CreateBatchUseCase:
+    return CreateBatchUseCase(batch_repository=_batch_repository(postgres_session), router_repository=_router_repository(postgres_session))
+
+
+def get_one_batch_use_case_factory(postgres_session: AsyncSession = Depends(get_postgres_session)) -> GetOneBatchUseCase:
+    return GetOneBatchUseCase(batch_repository=_batch_repository(postgres_session))
+
+
+def get_batches_use_case_factory(postgres_session: AsyncSession = Depends(get_postgres_session)) -> GetBatchesUseCase:
+    return GetBatchesUseCase(batch_repository=_batch_repository(postgres_session))
+
+
+def cancel_batch_use_case_factory(postgres_session: AsyncSession = Depends(get_postgres_session)) -> CancelBatchUseCase:
+    return CancelBatchUseCase(batch_repository=_batch_repository(postgres_session))
+
+
+def get_batch_results_use_case_factory(
+    # the results are read page by page while the response is sent: no transaction stays open meanwhile
+    postgres_session: AutocommitSession = Depends(get_autocommit_postgres_session),
+) -> GetBatchResultsUseCase:
+    return GetBatchResultsUseCase(batch_repository=_batch_repository(postgres_session))
 
 
 # chat use cases

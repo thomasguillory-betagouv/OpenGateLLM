@@ -1,10 +1,11 @@
 import datetime as dt
 from typing import Any, Optional
 
-from sqlalchemy import DateTime, ForeignKey, MetaData, UniqueConstraint, false, func
+from sqlalchemy import DateTime, ForeignKey, Index, MetaData, UniqueConstraint, false, func, text
 from sqlalchemy.orm import Mapped, declarative_base, mapped_column, relationship
 from sqlalchemy.types import JSON
 
+from api.domain.batch.entities import BatchProcessingStatus, BatchRequestStatus
 from api.domain.provider.entities import HostingZone, ProviderType
 from api.domain.role.entities import LimitType, PermissionType
 from api.domain.router.entities import RouterLoadBalancingStrategy, RouterType
@@ -220,3 +221,48 @@ class Provider(Base):
     usage: Mapped[list["Usage"]] = relationship(back_populates="provider", passive_deletes=True)
 
     __table_args__ = (UniqueConstraint("router_id", "url", "model_name", name="unique_provider_router_id_url_model_name"),)
+
+
+class Batch(Base):
+    __tablename__ = "batch"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey(column="user.id", ondelete="CASCADE"), index=True)
+    key_id: Mapped[int] = mapped_column(ForeignKey(column="token.id", ondelete="CASCADE"))
+    processing_status: Mapped[BatchProcessingStatus]
+    created: Mapped[dt.datetime] = mapped_column(UtcDateTime, insert_default=func.now())
+    expires: Mapped[dt.datetime] = mapped_column(UtcDateTime)
+    ended: Mapped[dt.datetime | None] = mapped_column(UtcDateTime)
+    cancel_initiated: Mapped[dt.datetime | None] = mapped_column(UtcDateTime)
+
+    user: Mapped["User"] = relationship()
+    key: Mapped["Token"] = relationship()
+    request: Mapped[list["BatchRequest"]] = relationship(back_populates="batch", cascade="all, delete-orphan", passive_deletes=True)
+
+
+class BatchRequest(Base):
+    __tablename__ = "batch_request"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey(column="batch.id", ondelete="CASCADE"))
+    custom_id: Mapped[str]
+    # rank of the request in its batch: claiming the lowest position first serves the least advanced batch first
+    position: Mapped[int]
+    params: Mapped[dict[str, Any]] = mapped_column(JSON)
+    status: Mapped[BatchRequestStatus]
+    attempts: Mapped[int] = mapped_column(default=0)
+    available_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, insert_default=func.now())
+    locked_until: Mapped[dt.datetime | None] = mapped_column(UtcDateTime)
+    response: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    error: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    completed: Mapped[dt.datetime | None] = mapped_column(UtcDateTime)
+
+    batch: Mapped["Batch"] = relationship(back_populates="request")
+
+    __table_args__ = (
+        UniqueConstraint("batch_id", "custom_id", name="unique_batch_request_batch_id_custom_id"),
+        UniqueConstraint("batch_id", "position", name="unique_batch_request_batch_id_position"),
+        Index("ix_batch_request_batch_id_status", "batch_id", "status"),
+        Index("ix_batch_request_pending", "position", "batch_id", postgresql_where=text("status = 'PENDING'")),
+        Index("ix_batch_request_processing", "locked_until", postgresql_where=text("status = 'PROCESSING'")),
+    )

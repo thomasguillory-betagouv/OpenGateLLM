@@ -11,6 +11,7 @@ from api.infrastructure.fastapi.schemas import UnixTimestamp
 class EndpointUsage(StrEnum):
     AUDIO_TRANSCRIPTIONS = f"/v1{EndpointRoute.AUDIO_TRANSCRIPTIONS}"
     CHAT_COMPLETIONS = f"/v1{EndpointRoute.CHAT_COMPLETIONS}"
+    CHAT_COMPLETIONS_BATCHES = f"/v1{EndpointRoute.CHAT_COMPLETIONS_BATCHES}"
     EMBEDDINGS = f"/v1{EndpointRoute.EMBEDDINGS}"
     OCR = f"/v1{EndpointRoute.OCR}"
     RERANK = f"/v1{EndpointRoute.RERANK}"

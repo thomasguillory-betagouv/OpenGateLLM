@@ -73,6 +73,11 @@ class Settings(HiddenInputSchema):
     # audio
     audio_file_size_limit: Annotated[int | None, Field(default=None, ge=0, description="Maximum size of the audio file in bytes. If not provided, the audio file size limit is not applied.", examples=[100_000_000])]  # fmt: off
 
+    # batches
+    batch_worker_concurrency: Annotated[int, Field(default=16, ge=1, description="Maximum number of batch requests a batch worker process forwards at the same time.")]  # fmt: off
+    batch_provider_capacity_share: Annotated[float, Field(default=0.5, gt=0.0, le=1.0, description="Share of a provider's `qos_limit` that batch requests may fill. A batch request is forwarded only while the provider holds fewer requests, interactive ones included, so interactive traffic always keeps the rest.")]  # fmt: off
+    batch_provider_default_concurrency: Annotated[int, Field(default=4, ge=1, description="Maximum number of requests, interactive ones included, a provider without `qos_limit` may hold for a batch request to be forwarded to it.")]  # fmt: off
+
     @field_validator("log_config", mode="after")
     def log_config_exists(cls, log_config):
         if log_config is not None and not Path(log_config).is_file():

@@ -24,6 +24,7 @@ infrastructure/
 app.py            create_app: middleware, router registration, monitoring
 dependencies.py   DI factories (transactional vs autocommit session)
 lifespan.py       startup/shutdown: builds what GlobalContext holds, runs bootstrap
+worker.py         composition root of the batch worker process (python -m api.worker), see adr/2026-11-11-batch-mode.md
 ```
 
 **Dependency rule:** `infrastructure → use_cases → domain`.
@@ -114,8 +115,8 @@ Three enums address the API surface, and they are **not the same concept**:
 
 | Enum | Location | Holds | Used by |
 |------|----------|-------|---------|
-| `RouterName` | `api/infrastructure/fastapi/routes.py` | the 14 routers + their `module_path` | `_register_routers`, `disabled_routers` / `hidden_routers`, `tags=[...]` |
-| `EndpointRoute` | `api/infrastructure/fastapi/routes.py` | the 22 mount paths | `@router.<verb>(path=...)` only |
+| `RouterName` | `api/infrastructure/fastapi/routes.py` | the 15 routers + their `module_path` | `_register_routers`, `disabled_routers` / `hidden_routers`, `tags=[...]` |
+| `EndpointRoute` | `api/infrastructure/fastapi/routes.py` | the 23 mount paths | `@router.<verb>(path=...)` only |
 | `ProviderEndpoint` | `api/domain/provider/entities.py` | the 7 **capabilities** a provider request targets | `ProviderRequest.endpoint`, `UnsupportedProviderEndpointError`, `HttpProviderAdapter.SOURCE_ENDPOINT`, `ADAPTER_REGISTRY`, the use cases' `ENDPOINT` |
 
 A new route needs an `EndpointRoute` member. A new **model-forward** capability also needs a `ProviderEndpoint` member — they are declared separately on purpose.

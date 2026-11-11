@@ -1,5 +1,6 @@
 from ._autocommitsession import AutocommitSession, TransactionRequiredError
 from ._postgresauthenticateduserquery import PostgresAuthenticatedUserQuery
+from ._postgresbatchrepository import PostgresBatchRepository
 from ._postgreskeyrepository import PostgresKeyRepository
 from ._postgreslimitrepository import PostgresLimitRepository
 from ._postgresmodelquery import PostgresModelQuery
@@ -15,6 +16,7 @@ __all__ = [
     "AutocommitSession",
     "TransactionRequiredError",
     "PostgresAuthenticatedUserQuery",
+    "PostgresBatchRepository",
     "PostgresKeyRepository",
     "PostgresLimitRepository",
     "PostgresModelQuery",

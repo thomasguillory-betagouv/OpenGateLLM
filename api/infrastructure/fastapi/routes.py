@@ -5,6 +5,7 @@ class RouterName(StrEnum):
     ADMIN = ("admin", "api.infrastructure.fastapi.endpoints.admin")
     AUDIO = ("audio", "api.infrastructure.fastapi.endpoints.audio")
     AUTH = ("auth", "api.infrastructure.fastapi.endpoints.auth")
+    BATCHES = ("batches", "api.infrastructure.fastapi.endpoints.batches")
     CHAT = ("chat", "api.infrastructure.fastapi.endpoints.chat")
     EMBEDDINGS = ("embeddings", "api.infrastructure.fastapi.endpoints.embeddings")
     HEALTH = ("health", "api.infrastructure.fastapi.endpoints.health")
@@ -36,6 +37,7 @@ class EndpointRoute(StrEnum):
     AUTH_LOGIN = "/auth/login"
     AUTH_SSO_LOGIN = "/auth/sso/login"
     CHAT_COMPLETIONS = "/chat/completions"
+    CHAT_COMPLETIONS_BATCHES = "/chat/completions/batches"
     EMBEDDINGS = "/embeddings"
     HEALTH = "/health"
     HEALTH_MODELS = "/health/models"
