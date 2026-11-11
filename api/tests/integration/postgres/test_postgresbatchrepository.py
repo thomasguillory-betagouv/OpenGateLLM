@@ -143,34 +143,35 @@ class TestClaimRequests:
 
     async def test_marks_the_claimed_request_as_processing_and_returns_its_owner(self, repository, db_session):
         # Arrange
-        request = BatchRequestSQLFactory()
+        batch = BatchSQLFactory()
+        request = BatchRequestSQLFactory(batch=batch)
         await db_session.flush()
+        # read before the Act: refreshing the request afterwards would unload its batch, and the lazy load cannot run here
+        expected = {
+            "id": request.id,
+            "batch_id": batch.id,
+            "custom_id": request.custom_id,
+            "position": request.position,
+            "params": request.params,
+            "user_id": batch.user_id,
+            "key_id": batch.key_id,
+        }
 
         # Act
         claimed = await repository.claim_requests(limit=10, lease_seconds=LEASE_SECONDS)
 
         # Assert
-        assert claimed == [
-            ClaimedBatchRequest(
-                id=request.id,
-                batch_id=request.batch_id,
-                custom_id=request.custom_id,
-                position=request.position,
-                params=request.params,
-                status=BatchRequestStatus.PROCESSING,
-                attempts=0,
-                user_id=request.batch.user_id,
-                key_id=request.batch.key_id,
-            )
-        ]
-        stored = await _stored_request(db_session, request.id)
+        stored = await _stored_request(db_session, expected["id"])
+        assert claimed == [ClaimedBatchRequest(**expected, status=BatchRequestStatus.PROCESSING, attempts=0, claim_id=stored.claim_id)]
         assert stored.status == BatchRequestStatus.PROCESSING
+        assert stored.claim_id is not None
         assert stored.locked_until is not None
 
-    async def test_skips_requests_not_yet_available_and_requests_of_expired_batches(self, repository, db_session):
+    async def test_skips_requests_not_yet_available_and_requests_of_expired_or_canceling_batches(self, repository, db_session):
         # Arrange
         BatchRequestSQLFactory(available_at=datetime.now(tz=UTC) + timedelta(hours=1))
         BatchRequestSQLFactory(batch=BatchSQLFactory(expires=datetime.now(tz=UTC) - timedelta(hours=1)))
+        BatchRequestSQLFactory(batch=BatchSQLFactory(processing_status=BatchProcessingStatus.CANCELING))
         await db_session.flush()
 
         # Act
@@ -182,31 +183,45 @@ class TestClaimRequests:
 
 @pytest.mark.asyncio(loop_scope="session")
 class TestCompleteRequest:
-    async def test_stores_the_result_of_a_processing_request(self, repository, db_session):
+    async def test_stores_the_result_of_a_claimed_request(self, repository, db_session):
         # Arrange
-        request = BatchRequestSQLFactory(status=BatchRequestStatus.PROCESSING)
+        request = BatchRequestSQLFactory(status=BatchRequestStatus.PROCESSING, claim_id="claim-1")
         await db_session.flush()
         error = BatchRequestError(type="StatusCodeModelError", message="Bad request", status_code=400)
 
         # Act
-        await repository.complete_request(request_id=request.id, status=BatchRequestStatus.ERRORED, response=None, error=error)
+        await repository.complete_request(claim_id="claim-1", status=BatchRequestStatus.ERRORED, response=None, error=error)
 
         # Assert
         stored = await _stored_request(db_session, request.id)
         assert stored.status == BatchRequestStatus.ERRORED
         assert stored.error == error.model_dump()
+        assert stored.claim_id is None
         assert stored.completed is not None
+
+    async def test_ignores_the_outcome_of_a_claim_that_expired_and_was_claimed_again(self, repository, db_session):
+        # Arrange
+        request = BatchRequestSQLFactory(status=BatchRequestStatus.PROCESSING, claim_id="second-claim")
+        await db_session.flush()
+
+        # Act
+        await repository.complete_request(claim_id="first-claim", status=BatchRequestStatus.SUCCEEDED, response={"id": "stale"}, error=None)
+
+        # Assert
+        stored = await _stored_request(db_session, request.id)
+        assert stored.status == BatchRequestStatus.PROCESSING
+        assert stored.response is None
 
 
 @pytest.mark.asyncio(loop_scope="session")
 class TestRequeueRequest:
     async def test_puts_the_request_back_in_the_queue_after_the_delay(self, repository, db_session):
         # Arrange
-        request = BatchRequestSQLFactory(status=BatchRequestStatus.PROCESSING, attempts=1)
+        request = BatchRequestSQLFactory(status=BatchRequestStatus.PROCESSING, attempts=1, claim_id="claim-1")
         await db_session.flush()
 
         # Act
-        await repository.requeue_request(request_id=request.id, delay_seconds=60, count_attempt=True)
+        await repository.requeue_request(claim_id="claim-1", delay_seconds=60, count_attempt=True)
 
         # Assert
         stored = await _stored_request(db_session, request.id)
@@ -216,10 +231,29 @@ class TestRequeueRequest:
 
 
 @pytest.mark.asyncio(loop_scope="session")
-class TestReleaseExpiredClaims:
-    async def test_returns_the_requests_of_a_dead_worker_to_the_queue(self, repository, db_session):
+class TestExtendClaims:
+    async def test_extends_the_lease_of_the_given_claims(self, repository, db_session):
         # Arrange
-        abandoned = BatchRequestSQLFactory(status=BatchRequestStatus.PROCESSING, locked_until=datetime.now(tz=UTC) - timedelta(hours=1))
+        almost_expired = datetime.now(tz=UTC) - timedelta(hours=2)
+        extended = BatchRequestSQLFactory(status=BatchRequestStatus.PROCESSING, claim_id="claim-1", locked_until=almost_expired)
+        other = BatchRequestSQLFactory(status=BatchRequestStatus.PROCESSING, claim_id="claim-2", locked_until=almost_expired)
+        await db_session.flush()
+
+        # Act
+        await repository.extend_claims(claim_ids=["claim-1"], lease_seconds=60)
+
+        # Assert
+        assert (await _stored_request(db_session, extended.id)).locked_until > almost_expired
+        assert (await _stored_request(db_session, other.id)).locked_until == almost_expired
+
+
+@pytest.mark.asyncio(loop_scope="session")
+class TestReleaseExpiredClaims:
+    async def test_returns_the_requests_of_a_dead_worker_to_the_queue_counting_an_attempt(self, repository, db_session):
+        # Arrange
+        abandoned = BatchRequestSQLFactory(
+            status=BatchRequestStatus.PROCESSING, claim_id="claim-1", attempts=1, locked_until=datetime.now(tz=UTC) - timedelta(hours=1)
+        )
         in_progress = BatchRequestSQLFactory(status=BatchRequestStatus.PROCESSING, locked_until=datetime.now(tz=UTC) + timedelta(hours=1))
         await db_session.flush()
 
@@ -228,8 +262,26 @@ class TestReleaseExpiredClaims:
 
         # Assert
         assert released == 1
-        assert (await _stored_request(db_session, abandoned.id)).status == BatchRequestStatus.PENDING
+        stored = await _stored_request(db_session, abandoned.id)
+        assert (stored.status, stored.attempts, stored.claim_id) == (BatchRequestStatus.PENDING, 2, None)
         assert (await _stored_request(db_session, in_progress.id)).status == BatchRequestStatus.PROCESSING
+
+
+@pytest.mark.asyncio(loop_scope="session")
+class TestCancelRequestsOfCancelingBatches:
+    async def test_cancels_the_requests_that_went_back_to_the_queue_after_the_cancellation(self, repository, db_session):
+        # Arrange
+        requeued = BatchRequestSQLFactory(batch=BatchSQLFactory(processing_status=BatchProcessingStatus.CANCELING))
+        in_progress_batch_request = BatchRequestSQLFactory()
+        await db_session.flush()
+
+        # Act
+        canceled = await repository.cancel_requests_of_canceling_batches()
+
+        # Assert
+        assert canceled == 1
+        assert (await _stored_request(db_session, requeued.id)).status == BatchRequestStatus.CANCELED
+        assert (await _stored_request(db_session, in_progress_batch_request.id)).status == BatchRequestStatus.PENDING
 
 
 @pytest.mark.asyncio(loop_scope="session")

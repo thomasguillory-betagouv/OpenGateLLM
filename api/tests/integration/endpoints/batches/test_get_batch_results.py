@@ -53,6 +53,15 @@ class TestGetBatchResults:
             },
         ]
 
+    async def test_returns_not_found_for_another_users_batch(self, client: AsyncClient, db_session):
+        other_batch = BatchSQLFactory(processing_status=BatchProcessingStatus.ENDED)
+        await db_session.flush()
+
+        response = await client.get(url=f"{URL}/{other_batch.id}/results", headers={"Authorization": f"Bearer {self.key.token}"})
+
+        assert response.status_code == 404, response.text
+        assert response.json().get("detail") == f"Batch {other_batch.id} not found."
+
     @pytest.mark.parametrize(
         "use_case_result,expected_status,expected_detail",
         [

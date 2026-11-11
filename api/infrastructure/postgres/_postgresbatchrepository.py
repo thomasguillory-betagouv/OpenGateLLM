@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import String, cast, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.domain.batch import BatchRepository
@@ -106,6 +106,7 @@ class PostgresBatchRepository(BatchRepository):
             .where(
                 BatchRequestTable.status == BatchRequestStatus.PENDING,
                 BatchRequestTable.available_at <= func.now(),
+                BatchTable.processing_status == BatchProcessingStatus.IN_PROGRESS,
                 BatchTable.expires > func.now(),
             )
             .order_by(BatchRequestTable.position, BatchRequestTable.batch_id)
@@ -115,7 +116,11 @@ class PostgresBatchRepository(BatchRepository):
         result = await self.postgres_session.execute(
             update(BatchRequestTable)
             .where(BatchRequestTable.id.in_(claimable), BatchRequestTable.batch_id == BatchTable.id)
-            .values(status=BatchRequestStatus.PROCESSING, locked_until=func.now() + timedelta(seconds=lease_seconds))
+            .values(
+                status=BatchRequestStatus.PROCESSING,
+                locked_until=func.now() + timedelta(seconds=lease_seconds),
+                claim_id=cast(func.gen_random_uuid(), String),
+            )
             .returning(
                 BatchRequestTable.id,
                 BatchRequestTable.batch_id,
@@ -123,12 +128,13 @@ class PostgresBatchRepository(BatchRepository):
                 BatchRequestTable.position,
                 BatchRequestTable.params,
                 BatchRequestTable.attempts,
+                BatchRequestTable.claim_id,
                 BatchTable.user_id,
                 BatchTable.key_id,
             )
             .execution_options(synchronize_session=False)
         )
-        return [
+        claimed_requests = [
             ClaimedBatchRequest(
                 id=row.id,
                 batch_id=row.batch_id,
@@ -137,30 +143,46 @@ class PostgresBatchRepository(BatchRepository):
                 params=row.params,
                 status=BatchRequestStatus.PROCESSING,
                 attempts=row.attempts,
+                claim_id=row.claim_id,
                 user_id=row.user_id,
                 key_id=row.key_id,
             )
             for row in result.all()
         ]
+        # RETURNING does not keep the order of the subquery
+        return sorted(claimed_requests, key=lambda request: (request.position, request.batch_id))
 
-    async def complete_request(self, request_id: int, status: BatchRequestStatus, response: dict | None, error: BatchRequestError | None) -> None:
+    async def extend_claims(self, claim_ids: list[str], lease_seconds: int) -> None:
+        if not claim_ids:
+            return
+
         await self.postgres_session.execute(
             update(BatchRequestTable)
-            .where(BatchRequestTable.id == request_id, BatchRequestTable.status == BatchRequestStatus.PROCESSING)
+            .where(BatchRequestTable.claim_id.in_(claim_ids), BatchRequestTable.status == BatchRequestStatus.PROCESSING)
+            .values(locked_until=func.now() + timedelta(seconds=lease_seconds))
+            .execution_options(synchronize_session=False)
+        )
+
+    async def complete_request(self, claim_id: str, status: BatchRequestStatus, response: dict | None, error: BatchRequestError | None) -> None:
+        await self.postgres_session.execute(
+            update(BatchRequestTable)
+            .where(BatchRequestTable.claim_id == claim_id, BatchRequestTable.status == BatchRequestStatus.PROCESSING)
             .values(
                 status=status,
                 response=response,
                 error=error.model_dump() if error is not None else None,
                 locked_until=None,
+                claim_id=None,
                 completed=func.now(),
             )
             .execution_options(synchronize_session=False)
         )
 
-    async def requeue_request(self, request_id: int, delay_seconds: float, count_attempt: bool) -> None:
+    async def requeue_request(self, claim_id: str, delay_seconds: float, count_attempt: bool) -> None:
         values = {
             "status": BatchRequestStatus.PENDING,
             "locked_until": None,
+            "claim_id": None,
             "available_at": func.now() + timedelta(seconds=delay_seconds),
         }
         if count_attempt:
@@ -168,7 +190,7 @@ class PostgresBatchRepository(BatchRepository):
 
         await self.postgres_session.execute(
             update(BatchRequestTable)
-            .where(BatchRequestTable.id == request_id, BatchRequestTable.status == BatchRequestStatus.PROCESSING)
+            .where(BatchRequestTable.claim_id == claim_id, BatchRequestTable.status == BatchRequestStatus.PROCESSING)
             .values(**values)
             .execution_options(synchronize_session=False)
         )
@@ -177,7 +199,23 @@ class PostgresBatchRepository(BatchRepository):
         result = await self.postgres_session.execute(
             update(BatchRequestTable)
             .where(BatchRequestTable.status == BatchRequestStatus.PROCESSING, BatchRequestTable.locked_until < func.now())
-            .values(status=BatchRequestStatus.PENDING, locked_until=None, available_at=func.now())
+            .values(
+                status=BatchRequestStatus.PENDING,
+                locked_until=None,
+                claim_id=None,
+                available_at=func.now(),
+                attempts=BatchRequestTable.attempts + 1,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        return result.rowcount
+
+    async def cancel_requests_of_canceling_batches(self) -> int:
+        canceling_batch_ids = select(BatchTable.id).where(BatchTable.processing_status == BatchProcessingStatus.CANCELING)
+        result = await self.postgres_session.execute(
+            update(BatchRequestTable)
+            .where(BatchRequestTable.status == BatchRequestStatus.PENDING, BatchRequestTable.batch_id.in_(canceling_batch_ids))
+            .values(status=BatchRequestStatus.CANCELED, completed=func.now())
             .execution_options(synchronize_session=False)
         )
         return result.rowcount

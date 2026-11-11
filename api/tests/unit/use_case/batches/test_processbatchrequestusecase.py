@@ -18,6 +18,7 @@ from api.domain.provider import (
     ProviderReservationRefused,
 )
 from api.domain.provider.entities import ProviderEndpoint, ProviderRequest, ProviderResponse, ProviderType
+from api.domain.role.entities import Limit, LimitType
 from api.domain.router import RouterRateLimiter, RouterRepository
 from api.domain.router.entities import RouterLoadBalancingStrategy, RouterType
 from api.domain.router.errors import RouterNotFoundError
@@ -103,7 +104,14 @@ def use_case(mock_model_tokenizer, mock_model_environmental_impacts_computer, mo
     return use_case
 
 
-def _command(attempts: int = 0) -> ProcessBatchRequestCommand:
+CLAIM_ID = "claim-1"
+
+
+def _user_with_access_to_the_router():
+    return AuthenticatedUserFactory(id=1, without_permission=True, limits=[Limit(router_id=1, type=LimitType.RPM, value=100)])
+
+
+def _command(attempts: int = 0, authenticated_user=None) -> ProcessBatchRequestCommand:
     batch_request = ClaimedBatchRequest(
         id=11,
         batch_id=3,
@@ -112,11 +120,15 @@ def _command(attempts: int = 0) -> ProcessBatchRequestCommand:
         params=PARAMS,
         status=BatchRequestStatus.PROCESSING,
         attempts=attempts,
+        claim_id=CLAIM_ID,
         user_id=1,
         key_id=2,
     )
     return ProcessBatchRequestCommand(
-        payload=PARAMS, authenticated_user=AuthenticatedUserFactory(id=1, admin=True), authenticated_key=KeyFactory(id=2), batch_request=batch_request
+        payload=PARAMS,
+        authenticated_user=authenticated_user or _user_with_access_to_the_router(),
+        authenticated_key=KeyFactory(id=2),
+        batch_request=batch_request,
     )
 
 
@@ -149,7 +161,7 @@ class TestProcessBatchRequestUseCase:
         use_case.provider_concurrency_limiter.release.assert_awaited_once()
         use_case.usage_repository.save_record.assert_called_once()
         stored = use_case.batch_repository.complete_request.await_args.kwargs
-        assert stored["request_id"] == 11
+        assert stored["claim_id"] == CLAIM_ID
         assert stored["status"] == BatchRequestStatus.SUCCEEDED
         assert stored["response"]["id"] == "chatcmpl-1"
         assert stored["response"]["usage"]["prompt_tokens"] == 10
@@ -169,6 +181,19 @@ class TestProcessBatchRequestUseCase:
         use_case.provider_concurrency_limiter.reserve.assert_awaited_once_with(request_id=REQUEST_ID, provider=provider, limit=DEFAULT_CONCURRENCY)
 
     @pytest.mark.asyncio
+    async def test_should_reserve_nothing_on_a_provider_too_small_to_share(self, use_case):
+        # Arrange
+        provider = ProviderFactory(id=9, router_id=1, qos_limit=1)
+        use_case.provider_repository.get_all_providers_of_router.return_value = [provider]
+        use_case.provider_concurrency_limiter.reserve.return_value = ProviderReservationRefused()
+
+        # Act
+        await use_case.execute(_command())
+
+        # Assert
+        use_case.provider_concurrency_limiter.reserve.assert_awaited_once_with(request_id=REQUEST_ID, provider=provider, limit=0)
+
+    @pytest.mark.asyncio
     async def test_should_complete_as_errored_when_the_model_is_not_usable(self, use_case):
         # Arrange
         use_case.router_repository.get_router_by_name_or_alias.return_value = RouterNotFoundError(name="chat-router")
@@ -180,8 +205,38 @@ class TestProcessBatchRequestUseCase:
         error = BatchRequestError(type="ModelNotFoundError", message="Model chat-router not found.", status_code=404)
         assert result == ProcessBatchRequestUseCaseFailed(request_id=11, error=error)
         use_case.batch_repository.complete_request.assert_awaited_once_with(
-            request_id=11, status=BatchRequestStatus.ERRORED, response=None, error=error
+            claim_id=CLAIM_ID, status=BatchRequestStatus.ERRORED, response=None, error=error
         )
+        use_case.provider_client.forward.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_should_complete_as_errored_when_the_user_lost_access_to_the_model(self, use_case):
+        # Arrange
+        user_without_access = AuthenticatedUserFactory(id=1, without_permission=True, limits=[])
+
+        # Act
+        result = await use_case.execute(_command(authenticated_user=user_without_access))
+
+        # Assert
+        assert result == ProcessBatchRequestUseCaseFailed(
+            request_id=11, error=BatchRequestError(type="ModelNotFoundError", message="Model chat-router not found.", status_code=404)
+        )
+        use_case.provider_client.forward.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_should_complete_as_errored_a_request_whose_attempts_are_exhausted(self, use_case):
+        # Act
+        result = await use_case.execute(_command(attempts=ProcessBatchRequestUseCase.MAX_ATTEMPTS))
+
+        # Assert
+        assert result == ProcessBatchRequestUseCaseFailed(
+            request_id=11,
+            error=BatchRequestError(
+                type="BatchRequestAttemptsExhaustedError",
+                message=f"The request was attempted {ProcessBatchRequestUseCase.MAX_ATTEMPTS} times without success.",
+            ),
+        )
+        use_case.router_repository.get_router_by_name_or_alias.assert_not_awaited()
         use_case.provider_client.forward.assert_not_awaited()
 
     @pytest.mark.parametrize("reservation", [ProviderReservationRefused(), ProviderLimitsCannotBeEnforced()])
@@ -196,7 +251,7 @@ class TestProcessBatchRequestUseCase:
         # Assert
         assert result == ProcessBatchRequestUseCaseRequeued(request_id=11, reason=BatchRequestRequeueReason.NO_CAPACITY)
         use_case.batch_repository.requeue_request.assert_awaited_once_with(
-            request_id=11, delay_seconds=ProcessBatchRequestUseCase.NO_CAPACITY_DELAY_SECONDS, count_attempt=False
+            claim_id=CLAIM_ID, delay_seconds=ProcessBatchRequestUseCase.NO_CAPACITY_DELAY_SECONDS, count_attempt=False
         )
         use_case.provider_client.forward.assert_not_awaited()
 
@@ -211,7 +266,7 @@ class TestProcessBatchRequestUseCase:
         # Assert
         assert result == ProcessBatchRequestUseCaseRequeued(request_id=11, reason=BatchRequestRequeueReason.RETRY)
         use_case.batch_repository.requeue_request.assert_awaited_once_with(
-            request_id=11, delay_seconds=ProcessBatchRequestUseCase.RETRY_DELAY_SECONDS * 2, count_attempt=True
+            claim_id=CLAIM_ID, delay_seconds=ProcessBatchRequestUseCase.RETRY_DELAY_SECONDS * 2, count_attempt=True
         )
         use_case.provider_concurrency_limiter.release.assert_awaited_once()
 

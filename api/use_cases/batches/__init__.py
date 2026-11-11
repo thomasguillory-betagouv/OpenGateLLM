@@ -1,6 +1,7 @@
 from ._cancelbatchusecase import CancelBatchCommand, CancelBatchUseCase, CancelBatchUseCaseSuccess
 from ._claimbatchrequestsusecase import BatchRequestClaim, ClaimBatchRequestsCommand, ClaimBatchRequestsUseCase, ClaimBatchRequestsUseCaseSuccess
 from ._createbatchusecase import CreateBatchCommand, CreateBatchUseCase, CreateBatchUseCaseSuccess
+from ._extendbatchrequestclaimsusecase import ExtendBatchRequestClaimsCommand, ExtendBatchRequestClaimsUseCase
 from ._getbatchesusecase import GetBatchesCommand, GetBatchesUseCase, GetBatchesUseCaseSuccess
 from ._getbatchresultsusecase import GetBatchResultsCommand, GetBatchResultsUseCase, GetBatchResultsUseCaseSuccess
 from ._getonebatchusecase import GetOneBatchCommand, GetOneBatchUseCase, GetOneBatchUseCaseSuccess
@@ -26,6 +27,8 @@ __all__ = [
     "CreateBatchCommand",
     "CreateBatchUseCase",
     "CreateBatchUseCaseSuccess",
+    "ExtendBatchRequestClaimsCommand",
+    "ExtendBatchRequestClaimsUseCase",
     "GetBatchesCommand",
     "GetBatchesUseCase",
     "GetBatchesUseCaseSuccess",

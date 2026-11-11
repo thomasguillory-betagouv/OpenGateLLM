@@ -74,8 +74,10 @@ class BatchRequest(BaseModel):
 
 
 class ClaimedBatchRequest(BatchRequest):
-    """A request a worker holds until it completes or requeues it. It carries the owner of its batch, whose access
-    is checked again when the request is processed."""
+    """A request a worker holds until it completes or requeues it, through its claim_id: once the claim has expired and
+    the request has been claimed again, the first worker can no longer write its outcome. It carries the owner of its
+    batch, whose access is checked again when the request is processed."""
 
+    claim_id: str
     user_id: int
     key_id: int

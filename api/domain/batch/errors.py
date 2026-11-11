@@ -19,3 +19,8 @@ class BatchNotEndedError:
 @dataclass
 class BatchCustomIdNotUniqueError:
     custom_ids: list[str]
+
+
+@dataclass
+class BatchRequestAttemptsExhaustedError:
+    attempts: int

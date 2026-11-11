@@ -6,6 +6,7 @@ from typing import ClassVar
 
 from api.domain.batch import BatchRepository
 from api.domain.batch.entities import BatchRequestError, BatchRequestStatus, ClaimedBatchRequest
+from api.domain.batch.errors import BatchRequestAttemptsExhaustedError
 from api.domain.chat.entities import CreateChatCompletionsBody
 from api.domain.model import ModelEnvironmentalImpactsComputer, ModelTokenizer
 from api.domain.model.errors import StatusCodeModelError, TooBusyModelError, UnknownModelError
@@ -103,6 +104,11 @@ class ProcessBatchRequestUseCase(ProviderRequestForwardingUseCase[ProcessBatchRe
     async def execute(self, command: ProcessBatchRequestCommand) -> ProcessBatchRequestUseCaseResult:
         batch_request = command.batch_request
 
+        # attempts also count the claims that expired: a request that kills its worker must not be retried forever
+        if batch_request.attempts >= self.MAX_ATTEMPTS:
+            error = BatchRequestAttemptsExhaustedError(attempts=batch_request.attempts)
+            return await self._complete_as_errored(batch_request=batch_request, error=error, model=command.model)
+
         result = await self._get_usable_router(authenticated_user=command.authenticated_user, model_name_or_alias=command.model)
         match result:
             case Router() as router:
@@ -121,7 +127,7 @@ class ProcessBatchRequestUseCase(ProviderRequestForwardingUseCase[ProcessBatchRe
             case ProviderReservationRefused() | ProviderLimitsCannotBeEnforced():
                 # when the load cannot be read either, waiting is safer than adding load to a provider that may be full
                 await self.batch_repository.requeue_request(
-                    request_id=batch_request.id, delay_seconds=self.NO_CAPACITY_DELAY_SECONDS, count_attempt=False
+                    claim_id=batch_request.claim_id, delay_seconds=self.NO_CAPACITY_DELAY_SECONDS, count_attempt=False
                 )
                 return ProcessBatchRequestUseCaseRequeued(request_id=batch_request.id, reason=BatchRequestRequeueReason.NO_CAPACITY)
 
@@ -140,7 +146,7 @@ class ProcessBatchRequestUseCase(ProviderRequestForwardingUseCase[ProcessBatchRe
                 batch_request.attempts + 1 < self.MAX_ATTEMPTS
             ):
                 delay_seconds = self.RETRY_DELAY_SECONDS * 2**batch_request.attempts
-                await self.batch_repository.requeue_request(request_id=batch_request.id, delay_seconds=delay_seconds, count_attempt=True)
+                await self.batch_repository.requeue_request(claim_id=batch_request.claim_id, delay_seconds=delay_seconds, count_attempt=True)
                 return ProcessBatchRequestUseCaseRequeued(request_id=batch_request.id, reason=BatchRequestRequeueReason.RETRY)
             case error:
                 return await self._complete_as_errored(batch_request=batch_request, error=error, model=command.model)
@@ -155,14 +161,14 @@ class ProcessBatchRequestUseCase(ProviderRequestForwardingUseCase[ProcessBatchRe
         self._record_and_save_usage(usage=usage, latency=latency)
 
         await self.batch_repository.complete_request(
-            request_id=batch_request.id, status=BatchRequestStatus.SUCCEEDED, response=provider_response.data.model_dump(), error=None
+            claim_id=batch_request.claim_id, status=BatchRequestStatus.SUCCEEDED, response=provider_response.data.model_dump(), error=None
         )
         return ProcessBatchRequestUseCaseSuccess(request_id=batch_request.id)
 
     async def _complete_as_errored(self, batch_request: ClaimedBatchRequest, error: object, model: str) -> ProcessBatchRequestUseCaseFailed:
         batch_request_error = self._to_batch_request_error(error=error, model=model)
         await self.batch_repository.complete_request(
-            request_id=batch_request.id, status=BatchRequestStatus.ERRORED, response=None, error=batch_request_error
+            claim_id=batch_request.claim_id, status=BatchRequestStatus.ERRORED, response=None, error=batch_request_error
         )
         return ProcessBatchRequestUseCaseFailed(request_id=batch_request.id, error=batch_request_error)
 
@@ -195,7 +201,8 @@ class ProcessBatchRequestUseCase(ProviderRequestForwardingUseCase[ProcessBatchRe
         if provider.qos_limit is None:
             return self.provider_default_concurrency
 
-        return max(1, math.floor(provider.qos_limit * self.provider_capacity_share))
+        # rounded down, possibly to 0: a provider too small to share serves no batch request rather than its only place
+        return math.floor(provider.qos_limit * self.provider_capacity_share)
 
     @staticmethod
     def _is_transient(error: TooBusyModelError | UnknownModelError | StatusCodeModelError) -> bool:
@@ -215,5 +222,7 @@ class ProcessBatchRequestUseCase(ProviderRequestForwardingUseCase[ProcessBatchRe
                 return BatchRequestError(type=type(error).__name__, message=str(detail), status_code=status_code)
             case UnknownModelError(status_code=status_code, detail=detail):
                 return BatchRequestError(type=type(error).__name__, message=str(detail), status_code=status_code)
+            case BatchRequestAttemptsExhaustedError(attempts=attempts):
+                return BatchRequestError(type=type(error).__name__, message=f"The request was attempted {attempts} times without success.")
             case _:
                 return BatchRequestError(type=type(error).__name__, message=str(error))

@@ -23,6 +23,7 @@ def claimed_request():
         params={"model": "m"},
         status=BatchRequestStatus.PROCESSING,
         attempts=0,
+        claim_id="claim-1",
         user_id=1,
         key_id=2,
     )
@@ -67,7 +68,7 @@ class TestClaimBatchRequestsUseCase:
         # Assert
         assert result.claims == []
         use_case.batch_repository.complete_request.assert_awaited_once_with(
-            request_id=11,
+            claim_id="claim-1",
             status=BatchRequestStatus.ERRORED,
             response=None,
             error=BatchRequestError(type="InvalidKeyError", message="The API key that created the batch is revoked or expired."),

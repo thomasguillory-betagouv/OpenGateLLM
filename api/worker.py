@@ -44,6 +44,8 @@ from api.use_cases.batches import (
     BatchRequestClaim,
     ClaimBatchRequestsCommand,
     ClaimBatchRequestsUseCase,
+    ExtendBatchRequestClaimsCommand,
+    ExtendBatchRequestClaimsUseCase,
     ProcessBatchRequestCommand,
     ProcessBatchRequestUseCase,
     ProcessBatchRequestUseCaseFailed,
@@ -55,8 +57,8 @@ from api.use_cases.batches import (
 
 logger = logging.getLogger(__name__)
 
-# longer than any provider timeout: a claim must not expire while its request is still being processed
-CLAIM_LEASE_SECONDS = 900
+# the worker extends the claims it holds every third of the lease: a claim expires about a minute after its worker dies
+CLAIM_LEASE_SECONDS = 60
 # usage.endpoint holds the route the consumption came through: GET /v1/usage tells batch usage apart this way
 BATCH_USAGE_ENDPOINT = f"/v1{EndpointRoute.CHAT_COMPLETIONS_BATCHES}"
 
@@ -131,7 +133,19 @@ async def run(configuration: Configuration, stop: asyncio.Event) -> None:
         async with session_factory() as session:
             return await ReconcileBatchesUseCase(batch_repository=PostgresBatchRepository(postgres_session=session)).execute()
 
-    worker = BatchWorker(concurrency=settings.batch_worker_concurrency, claim=claim, process=process, reconcile=reconcile)
+    async def extend_claims(claim_ids: list[str]) -> None:
+        async with session_factory() as session:
+            use_case = ExtendBatchRequestClaimsUseCase(batch_repository=PostgresBatchRepository(postgres_session=session))
+            await use_case.execute(ExtendBatchRequestClaimsCommand(claim_ids=claim_ids, lease_seconds=CLAIM_LEASE_SECONDS))
+
+    worker = BatchWorker(
+        concurrency=settings.batch_worker_concurrency,
+        heartbeat_interval_seconds=CLAIM_LEASE_SECONDS / 3,
+        claim=claim,
+        process=process,
+        reconcile=reconcile,
+        extend_claims=extend_claims,
+    )
     logger.info("Batch worker started (concurrency: %s).", settings.batch_worker_concurrency)
     try:
         await worker.run(stop=stop)

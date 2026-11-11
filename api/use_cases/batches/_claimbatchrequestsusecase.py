@@ -45,7 +45,9 @@ class ClaimBatchRequestsUseCase:
                     pass
                 case _:
                     error = BatchRequestError(type="InvalidKeyError", message="The API key that created the batch is revoked or expired.")
-                    await self.batch_repository.complete_request(request_id=request.id, status=BatchRequestStatus.ERRORED, response=None, error=error)
+                    await self.batch_repository.complete_request(
+                        claim_id=request.claim_id, status=BatchRequestStatus.ERRORED, response=None, error=error
+                    )
                     continue
 
             result = await self.authenticated_user_query.get_user_by_id(user_id=request.user_id)
@@ -54,7 +56,9 @@ class ClaimBatchRequestsUseCase:
                     pass
                 case _:
                     error = BatchRequestError(type="AccountExpiredError", message="The account that created the batch is expired.")
-                    await self.batch_repository.complete_request(request_id=request.id, status=BatchRequestStatus.ERRORED, response=None, error=error)
+                    await self.batch_repository.complete_request(
+                        claim_id=request.claim_id, status=BatchRequestStatus.ERRORED, response=None, error=error
+                    )
                     continue
 
             claims.append(BatchRequestClaim(request=request, authenticated_user=user, authenticated_key=key))

@@ -253,6 +253,8 @@ class BatchRequest(Base):
     attempts: Mapped[int] = mapped_column(default=0)
     available_at: Mapped[dt.datetime] = mapped_column(UtcDateTime, insert_default=func.now())
     locked_until: Mapped[dt.datetime | None] = mapped_column(UtcDateTime)
+    # identifies the claim being processed: only the worker holding it may write the outcome, not a worker whose lease expired
+    claim_id: Mapped[str | None]
     response: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     error: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     completed: Mapped[dt.datetime | None] = mapped_column(UtcDateTime)

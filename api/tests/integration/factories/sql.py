@@ -297,6 +297,7 @@ class BatchRequestSQLFactory(BaseSQLFactory):
     # Postgres now() is the start of the test transaction, which the factory runs after
     available_at = factory.LazyFunction(lambda: datetime.now(tz=UTC) - timedelta(hours=1))
     locked_until = None
+    claim_id = None
     response = None
     error = None
     completed = None

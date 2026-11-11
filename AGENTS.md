@@ -304,9 +304,10 @@ raising. Declare the difference on the field instead:
 
 The response never renames a field just to shorten it — name it after the entity attribute (`user_id`, not `user`).
 
-Last resort: a `@model_validator(mode="before")` when the response **restructures** the entity rather than renaming it. The single case
-today is `UsageResponse`, which nests `UsageRecord`'s flat counters under `usage`; it passes the record itself down instead of re-listing
-the other fields, so `from_attributes` still does all the field work.
+Last resort: a `@model_validator(mode="before")` when the response **restructures** the entity rather than renaming it. The cases
+today are `UsageResponse`, which nests `UsageRecord`'s flat counters under `usage` (it passes the record itself down instead of re-listing
+the other fields, so `from_attributes` still does all the field work), and `BatchResultResponse`, which nests a `BatchRequest`'s outcome
+under `result` as the results file of the batch API requires.
 
 Full rationale: `adr/2026-09-04-response-schema-mapping.md`.
 

@@ -45,6 +45,7 @@ def upgrade() -> None:
     sa.Column('attempts', sa.Integer(), nullable=False),
     sa.Column('available_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('locked_until', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('claim_id', sa.String(), nullable=True),
     sa.Column('response', sa.JSON(), nullable=True),
     sa.Column('error', sa.JSON(), nullable=True),
     sa.Column('completed', sa.DateTime(timezone=True), nullable=True),
