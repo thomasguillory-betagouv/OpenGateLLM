@@ -6,11 +6,20 @@
 * **Related:**
   * Proof of concept: branch `feat/batch-mode` (code, tests, benchmark script [`scripts/2026-11-11-batch-mode-benchmark.py`](scripts/2026-11-11-batch-mode-benchmark.py))
   * Reference API: [Anthropic Message Batches](https://platform.claude.com/docs/en/build-with-claude/batch-processing)
+  * [#656 — Batch endpoint](https://github.com/etalab-ia/OpenGateLLM/issues/656), [#999 — ADR - Batch endpoint stack](https://github.com/etalab-ia/OpenGateLLM/issues/999)
+  * The QoS ADR ([#1123](https://github.com/etalab-ia/OpenGateLLM/pull/1123), `adr/2026-09-02-qos.md`, since folded into the documentation by [#1180](https://github.com/etalab-ia/OpenGateLLM/pull/1180)), which announced this ADR
+  * [#531 — ADR - Request priorization + QoS without worker and rabbitmq](https://github.com/etalab-ia/OpenGateLLM/issues/531), [#1398 — Weighted provider load](https://github.com/etalab-ia/OpenGateLLM/issues/1398)
 * **Decision Outcome:** _pending review_. Proposal: add an asynchronous batch API for chat completions, modeled on Anthropic's Message Batches, processed by an optional worker that only uses the provider capacity interactive traffic leaves free.
 
 ---
 
 ## Context
+
+### The step after QoS
+
+The QoS ADR (#1123) set apart three related needs: prioritization, QoS, and batch — "launching jobs when the providers have spare capacity" — and announced a dedicated ADR for the last one: batch needs a load indicator, and QoS provides it (`load(p)`, the Redis count of the requests each provider holds). Issue #999 opened that ADR with two questions: pull or push, one worker or several.
+
+This ADR is that one. It answers pull, with as many workers as needed (decisions 2 and 3), and it admits batch requests on the QoS load (decision 4). It keeps the constraint #531 set when Celery and RabbitMQ were removed: Postgres and Redis remain the only mandatory dependencies.
 
 ### Bulk workloads compete with interactive users
 
@@ -88,7 +97,7 @@ Anthropic (Message Batches) and OpenAI (Batch API) both offer an asynchronous mo
 | `GET /v1/messages/batches` | `GET /v1/chat/completions/batches` | Paginated with `offset`/`limit`, like every list of the API. |
 | `POST /v1/messages/batches/{id}/cancel` | `POST /v1/chat/completions/batches/{batch_id}/cancel` | Pending requests are canceled at once, requests in progress run to the end. |
 | `GET /v1/messages/batches/{id}/results` | `GET /v1/chat/completions/batches/{batch_id}/results` | JSON Lines, one `{"custom_id", "result": {"type", "response", "error"}}` per request, available once the batch has ended. |
-| `DELETE /v1/messages/batches/{id}` | not in the POC | |
+| `DELETE /v1/messages/batches/{id}` | `DELETE /v1/chat/completions/batches/{batch_id}` | Final implementation, not in the POC. Deletes an ended batch with its requests and results; 409 for a batch in progress or canceling, which has to be canceled first. The retention purge (open question 5) deletes ended batches the same way. |
 
 The path nests the batch under the endpoint it batches, as Anthropic does. It leaves `/v1/batches` free for an OpenAI-compatible façade (see alternatives) and makes room for `/v1/embeddings/batches`. The new `RouterName.BATCHES` can be disabled like any router.
 
@@ -103,6 +112,7 @@ Postgres is the queue. Redis cannot be: gunicorn flushes it at every API start (
 * **Claim**: one `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING …` statement marks requests `processing`, gives each a `claim_id` and a lease (`locked_until`). Several workers never claim the same request. Only requests of batches `in_progress` are claimed.
 * **Lease**: the worker extends the leases of the requests it is processing every 20 s (lease: 60 s), so a claim stays valid however long the provider takes, and expires about a minute after its worker dies.
 * **Crash safety**: a request whose lease expires goes back to the queue and counts an attempt, so a request that kills its worker is not retried forever. The outcome is written only by the holder of the current `claim_id`: a worker whose claim expired cannot overwrite the result of the worker that claimed the request again.
+* **Billed once**: the usage row of a succeeded request is written in the same statement as its result (`UPDATE … RETURNING` in a CTE, then `INSERT INTO usage … SELECT`), conditioned on the claim. A request processed twice is billed once, by the worker whose result is stored.
 * **Fairness**: requests are claimed lowest `position` first (rank of the request in its batch), so a small batch submitted after a large one is not stuck behind it. The flip side: under a steady inflow of new batches, the tail of a large batch waits, and may expire.
 * Every worker-side statement is a single statement on an `AutocommitSession`: the worker never holds a transaction, nor a pooled connection, during a provider call.
 
@@ -112,6 +122,8 @@ Postgres is the queue. Redis cannot be: gunicorn flushes it at every API start (
 
 The worker is optional, and the reconciliation runs inside it: without a worker, batches are accepted and stay `in_progress` indefinitely.
 
+It runs from the API image with another command, so it adds a service to deploy but no dependency. For small deployments, the same loop could also run inside the API process, behind a setting (not in the POC): one service less, at the cost of sharing the API's CPU and shutdown (see alternative G).
+
 ### 4. Spare capacity only
 
 The provider concurrency limiter counts every request a provider holds, interactive or batch, in one Redis sorted set. Interactive requests reserve a place while the load is below `qos_limit`. Batch requests reserve one only while the load is below `batch_provider_capacity_share × qos_limit` rounded down (0.5 by default: 4 places out of 8, none out of 1), or below `batch_provider_default_concurrency` for providers without `qos_limit`.
@@ -120,6 +132,7 @@ The provider concurrency limiter counts every request a provider holds, interact
 * A batch request never waits for a provider and never gets a 429: without spare capacity it goes back to the queue and the worker pauses its claims briefly.
 * When Redis is unreachable and the load cannot be read, batch requests wait. Interactive requests keep failing open, as today.
 * A transient provider failure (timeout, 429, 5xx) is retried with exponential backoff, up to 3 attempts. Other failures end the request as `errored`.
+* The rule reads whatever load the limiter counts. Once it counts a weighted workload instead of requests (#1398), batch requests are capped in tokens with no change here.
 
 ### 5. Reuse
 
@@ -139,7 +152,7 @@ Each succeeded request writes a regular `usage` row with `endpoint = /v1/chat/co
 | D | **Anthropic-style inline batches** | **Selected**: no file storage, a contract developers know. |
 | E | Delegate to provider-native batch APIs (OpenAI, Mistral) | Out of scope: self-hosted vLLM has no online batch API. Could be an adapter later for external providers. |
 | F | A job queue library (Celery, arq, procrastinate) | Not needed: the Postgres queue fits in one repository class. Celery or arq would add a broker; procrastinate (Postgres-based) remains an option if the queue grows more complex. |
-| G | Run the worker inside the API processes (lifespan task) | Rejected: it couples batch load with API latency, multiplies workers by `gunicorn workers × replicas`, and constrains shutdown. |
+| G | Run the worker inside the API processes (lifespan task) | Not as the default: it couples batch load with API latency, multiplies workers by `gunicorn workers × replicas`, and constrains shutdown. Worth offering as an option for small deployments, which then have no service to add. |
 
 ---
 
@@ -155,7 +168,7 @@ Each succeeded request writes a regular `usage` row with `endpoint = /v1/chat/co
 
 * One more process to deploy and monitor (the worker), with its own Helm/compose service.
 * Two more tables, whose size grows with the results kept: a retention period and a purge job are needed.
-* At-least-once processing: if a worker dies after the provider answered but before the result is stored, the request is processed, and billed, twice. Only one result is stored.
+* At-least-once provider calls: if a worker dies after the provider answered but before the result is stored, another worker sends the request again. It is billed once, since its usage row is written with its result, but the GPU time of the first call is lost. Calling the provider exactly once would need an idempotency key on the provider side, which vLLM does not offer; the window is the few milliseconds between the provider's answer and the write.
 * Maintenance surface: the POC adds about 1,900 lines of production code and 1,450 lines of tests.
 
 ---
@@ -168,7 +181,7 @@ Not in the POC (needed before production):
 
 * **quotas for batches (blocking)**: the POC neither checks nor charges any rate limit for batch requests, so a user with an RPD limit could bypass it through a batch. The router must ship disabled until open question 1 is settled;
 * a batch price (open question 2);
-* retention and purge of results, `DELETE`;
+* retention and purge of results, and `DELETE` (decision 1);
 * Prometheus metrics (queue depth, batch throughput), Langfuse traces for batch requests (the worker uses a no-op tracer);
 * the `test_autocommitsession.py`-style probe for the worker;
 * claiming per router: a worker currently claims before knowing whether the router has spare capacity, and pauses all claims when one router is full;
@@ -181,9 +194,9 @@ Not in the POC (needed before production):
 
 The author has no access to these data; they decide how much capacity a batch mode would actually find, and how many users it would serve.
 
-1. **GPU utilization** over a typical week (the `vllm` Grafana dashboards): how much capacity is idle outside office hours, per model.
+1. **GPU utilization** over a typical week (the `vllm` Grafana dashboards): how much capacity is idle per model, between the peaks of office hours as well as at night. Batch requests use spare capacity whenever it appears, not only at night.
 2. **Demand**: how many users have asked for higher quotas, for the night shift role, or for a batch mode, and for which volumes.
-3. **Ongoing work**: whether a batch mode is already being designed or developed for Albert API, so that this ADR feeds it rather than duplicates it.
+3. **Ongoing work**: #999 was closed in September 2026 without a batch ADR in the repository, and no branch or pull request implements one. If a design exists elsewhere (the Excalidraw draft attached to #999), this ADR should be reconciled with it rather than duplicate it.
 4. **A run on a staging vLLM**: the figures above come from a mock. The benchmark script can target a real provider instead (`--provider-url`, `--provider-model`, `--slots` for its `qos_limit`).
 
 ---
@@ -197,7 +210,7 @@ The author has no access to these data; they decide how much capacity a batch mo
 5. **Limits and retention.** 10,000 requests per batch in the POC (Anthropic: 100,000 or 256 MB, too heavy to parse in an API worker). How long are results kept (Anthropic: 29 days)?
 6. **URL.** `/v1/chat/completions/batches` (proposed) or `/v1/batches`?
 7. **Results errors.** The POC reports domain error names (`ModelNotFoundError`, `StatusCodeModelError`…). Do we want a public error taxonomy?
-8. **Deployment.** Is a separate worker service acceptable for the deployments we know of (Albert, others)?
+8. **Deployment.** Is a separate worker service acceptable for the deployments we know of (Albert, others), or should the embedded mode (alternative G) come first?
 
 ---
 
