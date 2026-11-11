@@ -1,7 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from api.domain.batch.entities import (
     Batch,
@@ -13,8 +13,10 @@ from api.domain.batch.entities import (
     ClaimedBatchRequest,
 )
 from api.domain.batch.errors import BatchNotFoundError
+from api.domain.usage.entities import Usage, UsageRecord
 from api.infrastructure.postgres import PostgresBatchRepository
 from api.infrastructure.postgres.models import BatchRequest as BatchRequestTable
+from api.infrastructure.postgres.models import Usage as UsageTable
 from api.tests.integration.factories.sql import BatchRequestSQLFactory, BatchSQLFactory, KeySQLFactory
 
 LEASE_SECONDS = 600
@@ -211,6 +213,61 @@ class TestCompleteRequest:
         stored = await _stored_request(db_session, request.id)
         assert stored.status == BatchRequestStatus.PROCESSING
         assert stored.response is None
+
+
+def _usage_record(user_id: int, request_id: str = "batch-request-1") -> UsageRecord:
+    return UsageRecord(
+        request_id=request_id,
+        endpoint="/v1/chat/completions/batches",
+        created=datetime.now(tz=UTC),
+        user_id=user_id,
+        latency=500,
+        usage=Usage(prompt_tokens=10, completion_tokens=20, total_tokens=30, cost=0.5),
+    )
+
+
+async def _usage_rows(db_session, request_id: str) -> list[UsageTable]:
+    return list(await db_session.scalars(select(UsageTable).where(UsageTable.request_id == request_id)))
+
+
+@pytest.mark.asyncio(loop_scope="session")
+class TestCompleteRequestAndSaveUsage:
+    async def test_stores_the_result_and_its_usage_row_together(self, repository, db_session):
+        # Arrange
+        batch = BatchSQLFactory()
+        request = BatchRequestSQLFactory(batch=batch, status=BatchRequestStatus.PROCESSING, claim_id="claim-1")
+        await db_session.flush()
+        request_id, user_id = request.id, batch.user_id
+
+        # Act
+        await repository.complete_request_and_save_usage(claim_id="claim-1", response={"id": "chatcmpl-1"}, usage_record=_usage_record(user_id))
+
+        # Assert
+        stored = await _stored_request(db_session, request_id)
+        assert (stored.status, stored.response, stored.claim_id) == (BatchRequestStatus.SUCCEEDED, {"id": "chatcmpl-1"}, None)
+        [usage_row] = await _usage_rows(db_session, "batch-request-1")
+        assert (usage_row.user_id, usage_row.endpoint, usage_row.total_tokens, usage_row.cost, usage_row.status) == (
+            user_id,
+            "/v1/chat/completions/batches",
+            30,
+            0.5,
+            200,
+        )
+
+    async def test_bills_nothing_for_a_claim_that_expired_and_was_claimed_again(self, repository, db_session):
+        # Arrange
+        batch = BatchSQLFactory()
+        request = BatchRequestSQLFactory(batch=batch, status=BatchRequestStatus.PROCESSING, claim_id="second-claim")
+        await db_session.flush()
+        request_id, user_id = request.id, batch.user_id
+        usage_rows_before = await db_session.scalar(select(func.count()).select_from(UsageTable))
+
+        # Act
+        await repository.complete_request_and_save_usage(claim_id="first-claim", response={"id": "stale"}, usage_record=_usage_record(user_id))
+
+        # Assert
+        assert (await _stored_request(db_session, request_id)).status == BatchRequestStatus.PROCESSING
+        assert await db_session.scalar(select(func.count()).select_from(UsageTable)) == usage_rows_before
 
 
 @pytest.mark.asyncio(loop_scope="session")

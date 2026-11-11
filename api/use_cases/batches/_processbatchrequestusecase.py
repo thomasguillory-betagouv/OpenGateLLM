@@ -158,10 +158,12 @@ class ProcessBatchRequestUseCase(ProviderRequestForwardingUseCase[ProcessBatchRe
         )
         usage = self._compute_usage(provider=provider, router=router, billed_tokens=billed_tokens, latency=latency)
         provider_response = provider_response.with_usage(usage)
-        self._record_and_save_usage(usage=usage, latency=latency)
+        self.usage_context.record_usage(usage=usage, latency=latency)
 
-        await self.batch_repository.complete_request(
-            claim_id=batch_request.claim_id, status=BatchRequestStatus.SUCCEEDED, response=provider_response.data.model_dump(), error=None
+        # unlike an interactive request, the usage row is written with the result, not through the usage repository: a
+        # request processed twice, after its worker died, is then billed once
+        await self.batch_repository.complete_request_and_save_usage(
+            claim_id=batch_request.claim_id, response=provider_response.data.model_dump(), usage_record=self.usage_context.get_record()
         )
         return ProcessBatchRequestUseCaseSuccess(request_id=batch_request.id)
 

@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 
-from sqlalchemy import String, cast, func, insert, select, update
+from sqlalchemy import String, cast, func, insert, literal, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.domain.batch import BatchRepository
@@ -16,9 +16,13 @@ from api.domain.batch.entities import (
     ClaimedBatchRequest,
 )
 from api.domain.batch.errors import BatchNotFoundError
-from api.infrastructure.postgres._pagination import fetch_page_with_total
+from api.domain.usage.entities import UsageRecord
 from api.infrastructure.postgres.models import Batch as BatchTable
 from api.infrastructure.postgres.models import BatchRequest as BatchRequestTable
+from api.infrastructure.postgres.models import Usage as UsageTable
+
+from ._pagination import fetch_page_with_total
+from ._postgresusagerepository import PostgresUsageRepository
 
 UNFINISHED_REQUEST_STATUSES = (BatchRequestStatus.PENDING, BatchRequestStatus.PROCESSING)
 
@@ -176,6 +180,32 @@ class PostgresBatchRepository(BatchRepository):
                 completed=func.now(),
             )
             .execution_options(synchronize_session=False)
+        )
+
+    async def complete_request_and_save_usage(self, claim_id: str, response: dict, usage_record: UsageRecord) -> None:
+        completed_request = (
+            update(BatchRequestTable)
+            .where(BatchRequestTable.claim_id == claim_id, BatchRequestTable.status == BatchRequestStatus.PROCESSING)
+            .values(
+                status=BatchRequestStatus.SUCCEEDED,
+                response=response,
+                error=None,
+                locked_until=None,
+                claim_id=None,
+                completed=func.now(),
+            )
+            .returning(BatchRequestTable.id)
+            .cte("completed_request")
+        )
+        usage_columns = UsageTable.__table__.columns
+        usage_values = [
+            literal(value, type_=usage_columns[name].type).label(name) for name, value in PostgresUsageRepository.row_values(usage_record).items()
+        ]
+        # one statement, atomic even on an AutocommitSession: the usage row is written only if the result is
+        await self.postgres_session.execute(
+            insert(UsageTable)
+            .from_select([value.name for value in usage_values], select(*usage_values).select_from(completed_request))
+            .add_cte(completed_request)
         )
 
     async def requeue_request(self, claim_id: str, delay_seconds: float, count_attempt: bool) -> None:

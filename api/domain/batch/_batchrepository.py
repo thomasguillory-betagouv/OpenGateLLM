@@ -3,6 +3,7 @@ from datetime import datetime
 
 from api.domain.batch.entities import Batch, BatchPage, BatchRequest, BatchRequestError, BatchRequestStatus, BatchRequestToCreate, ClaimedBatchRequest
 from api.domain.batch.errors import BatchNotFoundError
+from api.domain.usage.entities import UsageRecord
 
 
 class BatchRepository(ABC):
@@ -44,6 +45,12 @@ class BatchRepository(ABC):
     @abstractmethod
     async def complete_request(self, claim_id: str, status: BatchRequestStatus, response: dict | None, error: BatchRequestError | None) -> None:
         """Store the outcome of a claimed request. Does nothing if the claim has expired in the meantime."""
+        pass
+
+    @abstractmethod
+    async def complete_request_and_save_usage(self, claim_id: str, response: dict, usage_record: UsageRecord) -> None:
+        """Store the result of a claimed request that succeeded, and its usage row, in one atomic write. Does nothing if the
+        claim has expired in the meantime: a request processed twice, after a worker died, is billed once."""
         pass
 
     @abstractmethod

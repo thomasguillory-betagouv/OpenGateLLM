@@ -159,12 +159,15 @@ class TestProcessBatchRequestUseCase:
         assert forwarded_request == ProviderRequest(id=REQUEST_ID, endpoint=ProviderEndpoint.CHAT_COMPLETIONS, payload=forwarded_request.payload)
         assert forwarded_request.payload.messages == PARAMS["messages"]
         use_case.provider_concurrency_limiter.release.assert_awaited_once()
-        use_case.usage_repository.save_record.assert_called_once()
-        stored = use_case.batch_repository.complete_request.await_args.kwargs
+        recorded_usage = use_case.usage_context.record_usage.call_args.kwargs
+        assert (recorded_usage["usage"].prompt_tokens, recorded_usage["latency"]) == (10, 500)
+        stored = use_case.batch_repository.complete_request_and_save_usage.await_args.kwargs
         assert stored["claim_id"] == CLAIM_ID
-        assert stored["status"] == BatchRequestStatus.SUCCEEDED
         assert stored["response"]["id"] == "chatcmpl-1"
         assert stored["response"]["usage"]["prompt_tokens"] == 10
+        assert stored["usage_record"] is use_case.usage_context.get_record.return_value
+        use_case.usage_repository.save_record.assert_not_called()
+        use_case.batch_repository.complete_request.assert_not_awaited()
         use_case.router_rate_limiter.update_rate_limit_state.assert_not_called()
 
     @pytest.mark.asyncio

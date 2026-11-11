@@ -29,34 +29,40 @@ class PostgresUsageRepository(UsageRepository):
 
     async def _insert(self, record: UsageRecord) -> None:
         try:
-            row = UsageTable(
-                created=record.created,
-                request_id=record.request_id,
-                endpoint=record.endpoint,
-                user_id=record.user_id,
-                user_email=record.user_email,
-                token_id=record.key_id,
-                token_name=record.key_name,
-                router_id=record.router_id,
-                router_name=record.router_name,
-                provider_id=record.provider_id,
-                provider_model_name=record.provider_model_name,
-                # only a request that consumed something is saved, so the row is a success by construction
-                status=200,
-                latency=record.latency,
-                ttft=record.ttft,
-                prompt_tokens=record.usage.prompt_tokens,
-                completion_tokens=record.usage.completion_tokens,
-                total_tokens=record.usage.total_tokens,
-                cost=record.usage.cost,
-                kwh=record.usage.impacts.kWh,
-                kgco2eq=record.usage.impacts.kgCO2eq,
-            )
+            row = UsageTable(**self.row_values(record))
             async with self.session_factory() as postgres_session:
                 postgres_session.add(row)
                 await postgres_session.commit()
         except Exception:
             logger.exception("Failed to save the usage record.")
+
+    @staticmethod
+    def row_values(record: UsageRecord) -> dict:
+        """The columns of the usage row of a record. Also used by PostgresBatchRepository, which writes a batch request's
+        usage row in the same statement as its result."""
+        return {
+            "created": record.created,
+            "request_id": record.request_id,
+            "endpoint": record.endpoint,
+            "user_id": record.user_id,
+            "user_email": record.user_email,
+            "token_id": record.key_id,
+            "token_name": record.key_name,
+            "router_id": record.router_id,
+            "router_name": record.router_name,
+            "provider_id": record.provider_id,
+            "provider_model_name": record.provider_model_name,
+            # only a request that consumed something is saved, so the row is a success by construction
+            "status": 200,
+            "latency": record.latency,
+            "ttft": record.ttft,
+            "prompt_tokens": record.usage.prompt_tokens,
+            "completion_tokens": record.usage.completion_tokens,
+            "total_tokens": record.usage.total_tokens,
+            "cost": record.usage.cost,
+            "kwh": record.usage.impacts.kWh,
+            "kgco2eq": record.usage.impacts.kgCO2eq,
+        }
 
     @staticmethod
     async def wait_for_pending_saves(timeout: float) -> None:
