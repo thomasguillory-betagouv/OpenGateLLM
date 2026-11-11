@@ -13,11 +13,16 @@ Prerequisites: a Postgres and a Redis reachable with the URLs below (the script 
     python adr/scripts/2026-11-11-batch-mode-benchmark.py --output benchmark.json
 
 `--fake-tokenizer` replaces the tiktoken encoding with a length-based count, for machines that cannot download it.
+
+To measure a real provider instead of the mock, pass `--provider-url` (an OpenAI-compatible server, a vLLM for
+instance), `--provider-model` (the model name it serves) and `--slots` (the qos_limit to apply to it), and set the
+`BENCHMARK_PROVIDER_KEY` environment variable if it needs a key. Size `--rate`, `--bulk-requests` and
+`--bulk-concurrency` to its capacity.
 """
 
 import argparse
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 import json
 import os
 from pathlib import Path
@@ -139,9 +144,10 @@ def write_configuration(args: argparse.Namespace, path: Path) -> None:
                         "qos_retries_before_reject": args.qos_retries,
                         "providers": [
                             {
-                                "type": "vllm",
-                                "url": f"http://127.0.0.1:{args.mock_port}",
-                                "model_name": MODEL_NAME,
+                                "type": args.provider_type,
+                                "url": args.provider_url or f"http://127.0.0.1:{args.mock_port}",
+                                "key": os.getenv("BENCHMARK_PROVIDER_KEY"),
+                                "model_name": args.provider_model,
                                 "qos_limit": args.slots,
                                 "timeout": 120,
                             }
@@ -290,6 +296,20 @@ def summarize(results: list[tuple[float, int]]) -> dict:
 # --------------------------------------------------------------------------- scenarios
 
 
+class ProviderStats:
+    """What the mock provider saw (requests, highest concurrency). A real provider reports nothing."""
+
+    def __init__(self, mock: httpx.AsyncClient | None) -> None:
+        self.mock = mock
+
+    async def reset(self) -> None:
+        if self.mock is not None:
+            await self.mock.post("/stats/reset")
+
+    async def read(self) -> dict | None:
+        return (await self.mock.get("/stats")).json() if self.mock is not None else None
+
+
 async def benchmark(args: argparse.Namespace) -> dict:
     configuration_file = Path(tempfile.mkdtemp()) / "config.json"
     write_configuration(args, configuration_file)
@@ -297,9 +317,15 @@ async def benchmark(args: argparse.Namespace) -> dict:
     reset_dependencies(args, environment)
     tokenizer_flag = ["--fake-tokenizer"] if args.fake_tokenizer else []
 
-    mock_command = ["mock", "--port", str(args.mock_port), "--slots", str(args.slots), "--service-time", str(args.service_time)]
-    async with running(start(mock_command, environment)):
-        await wait_until_ready(f"http://127.0.0.1:{args.mock_port}/stats")
+    async with AsyncExitStack() as stack:
+        mock = None
+        if args.provider_url is None:
+            mock_command = ["mock", "--port", str(args.mock_port), "--slots", str(args.slots), "--service-time", str(args.service_time)]
+            await stack.enter_async_context(running(start(mock_command, environment)))
+            await wait_until_ready(f"http://127.0.0.1:{args.mock_port}/stats")
+            mock = await stack.enter_async_context(httpx.AsyncClient(base_url=f"http://127.0.0.1:{args.mock_port}"))
+        provider = ProviderStats(mock)
+
         async with running(start(["api", "--port", str(args.api_port), *tokenizer_flag], environment)):
             api_url = f"http://127.0.0.1:{args.api_port}"
             await wait_until_ready(f"{api_url}/health")
@@ -310,30 +336,27 @@ async def benchmark(args: argparse.Namespace) -> dict:
                 key = login.json()["value"]
 
             headers = {"Authorization": f"Bearer {key}"}
-            async with (
-                httpx.AsyncClient(base_url=api_url, headers=headers, timeout=600, limits=httpx.Limits(max_connections=500)) as client,
-                httpx.AsyncClient(base_url=f"http://127.0.0.1:{args.mock_port}") as mock,
-            ):
+            async with httpx.AsyncClient(base_url=api_url, headers=headers, timeout=600, limits=httpx.Limits(max_connections=500)) as client:
                 report = {"parameters": vars(args), "scenarios": {}}
 
                 print("Scenario 1/4: interactive traffic alone", flush=True)
-                await mock.post("/stats/reset")
+                await provider.reset()
                 interactive = await interactive_load(client, duration=args.duration, rate=args.rate, seed=1)
-                report["scenarios"]["interactive_alone"] = {"interactive": summarize(interactive), "provider": (await mock.get("/stats")).json()}
+                report["scenarios"]["interactive_alone"] = {"interactive": summarize(interactive), "provider": await provider.read()}
 
                 print("Scenario 2/4: interactive traffic + bulk job through /v1/chat/completions", flush=True)
-                await mock.post("/stats/reset")
+                await provider.reset()
                 bulk = asyncio.create_task(naive_bulk_job(client, requests=args.bulk_requests, concurrency=args.bulk_concurrency))
                 await asyncio.sleep(2)  # let the bulk job ramp up
                 interactive = await interactive_load(client, duration=args.duration, rate=args.rate, seed=2)
                 report["scenarios"]["interactive_with_naive_bulk"] = {
                     "interactive": summarize(interactive),
                     "bulk": await bulk,
-                    "provider": (await mock.get("/stats")).json(),
+                    "provider": await provider.read(),
                 }
 
                 print("Scenario 3/4: interactive traffic + the same job as a batch", flush=True)
-                await mock.post("/stats/reset")
+                await provider.reset()
                 async with running(start(["worker", *tokenizer_flag], environment)):
                     batch = asyncio.create_task(batch_job(client, requests=args.bulk_requests))
                     await asyncio.sleep(2)
@@ -341,14 +364,14 @@ async def benchmark(args: argparse.Namespace) -> dict:
                     report["scenarios"]["interactive_with_batch"] = {
                         "interactive": summarize(interactive),
                         "batch": await batch,
-                        "provider": (await mock.get("/stats")).json(),
+                        "provider": await provider.read(),
                     }
 
                     print("Scenario 4/4: the batch alone", flush=True)
-                    await mock.post("/stats/reset")
+                    await provider.reset()
                     report["scenarios"]["batch_alone"] = {
                         "batch": await batch_job(client, requests=args.bulk_requests),
-                        "provider": (await mock.get("/stats")).json(),
+                        "provider": await provider.read(),
                     }
 
     return report
@@ -382,7 +405,10 @@ def main() -> None:
     parser.add_argument("--redis-url", default="redis://:changeme@localhost:6379/4")
     parser.add_argument("--mock-port", type=int, default=9100)
     parser.add_argument("--api-port", "--port", dest="api_port", type=int, default=8100)
-    parser.add_argument("--slots", type=int, default=8, help="Requests the mock provider computes at once (its qos_limit).")
+    parser.add_argument("--provider-url", default=None, help="Benchmark this OpenAI-compatible provider instead of the mock.")
+    parser.add_argument("--provider-type", default="vllm", help="Provider type of --provider-url, as in the configuration file.")
+    parser.add_argument("--provider-model", default=MODEL_NAME, help="Model name served by --provider-url.")
+    parser.add_argument("--slots", type=int, default=8, help="qos_limit of the provider, and the capacity of the mock.")
     parser.add_argument("--service-time", type=float, default=0.5, help="Seconds the mock provider takes per request.")
     parser.add_argument("--qos-retries", type=int, default=20, help="qos_retries_before_reject of the router (0.5 s each).")
     parser.add_argument("--rate", type=float, default=4.0, help="Interactive requests per second.")

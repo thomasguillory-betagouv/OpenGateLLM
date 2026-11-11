@@ -2,7 +2,7 @@
 
 * **Status:** Proposed
 * **Date:** 2026-11-11
-* **Authors:** _to be completed_
+* **Authors:** Thomas Guillory
 * **Related:**
   * Proof of concept: branch `feat/batch-mode` (code, tests, benchmark script [`scripts/2026-11-11-batch-mode-benchmark.py`](scripts/2026-11-11-batch-mode-benchmark.py))
   * Reference API: [Anthropic Message Batches](https://platform.claude.com/docs/en/build-with-claude/batch-processing)
@@ -22,9 +22,21 @@ Today the only way to run such a job is to loop over `POST /v1/chat/completions`
 * Rate limits (RPM/TPM) are the only lever left, and they cap the bulk job without protecting the other users.
 * The client has to implement concurrency control, retries and resumption itself, and keep connections open for the whole job.
 
-> **TODO (figures):** GPU utilization over a typical week (Grafana `vllm` dashboards), to size the idle capacity outside office hours.
->
-> **TODO (demand):** user requests for bulk processing (support tickets, issues, known projects looping over the API).
+### A concrete need: API Projets Collectivités
+
+API Projets Collectivités (DINUM) classifies stocks of local government projects with Gemma 4 31B on Albert API, the main OpenGateLLM deployment. Its workloads:
+
+| Workload | Volume | Latency constraint |
+|---|---|---|
+| Full reclassification of the project stock | ~1M requests every 4 to 6 months | None, as long as the job ends in reasonable time |
+| New data source, partial reclassification | ~100k requests a month, up to 300k for a new source | None |
+| Daily run | ~10k requests a day | Regular API calls |
+
+These jobs run today on a non-sovereign provider, where the full reclassification takes a few hours, and the team wants to move them to a sovereign stack. With the quotas of a production role on Albert API (100 RPM, 50,000 RPD), the daily limit alone stretches the full reclassification over 20 days, and the per-minute limit makes iterating on a prompt impractical.
+
+The deployment already answers such needs, by hand: a temporary "night shift" role (1,000 RPM, no daily limit, to be used at night), granted by the team for two or three one-shot runs. It works, but it does not scale: each run needs a person on both sides, the night is a proxy for spare capacity rather than a measure of it, and nothing stops such a job from competing with interactive users when the night is not as quiet as expected. A batch mode does the same thing without the manual step, and only uses the capacity that is actually free.
+
+How often other users ask for the same thing is for the Albert API team to say (see "To be checked by the maintainers").
 
 ### Measured impact (synthetic benchmark)
 
@@ -162,6 +174,17 @@ Not in the POC (needed before production):
 * claiming per router: a worker currently claims before knowing whether the router has spare capacity, and pauses all claims when one router is full;
 * refactoring rather than copying: `ProcessBatchRequestUseCase` copies the provider reservation loop of the forwarding template with another limit, and carries a rate limiter it never calls. Passing the limit to the template, and moving `UsageRecorder` out of `infrastructure/fastapi/`, would remove both;
 * Helm/compose service, documentation, playground page, `AGENTS.md` section on the worker.
+
+---
+
+## To be checked by the maintainers
+
+The author has no access to these data; they decide how much capacity a batch mode would actually find, and how many users it would serve.
+
+1. **GPU utilization** over a typical week (the `vllm` Grafana dashboards): how much capacity is idle outside office hours, per model.
+2. **Demand**: how many users have asked for higher quotas, for the night shift role, or for a batch mode, and for which volumes.
+3. **Ongoing work**: whether a batch mode is already being designed or developed for Albert API, so that this ADR feeds it rather than duplicates it.
+4. **A run on a staging vLLM**: the figures above come from a mock. The benchmark script can target a real provider instead (`--provider-url`, `--provider-model`, `--slots` for its `qos_limit`).
 
 ---
 
